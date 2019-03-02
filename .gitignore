@@ -33,4 +33,8 @@ vignettes/*.pdf
 *.knit.md
 
 # Shiny token, see https://shiny.rstudio.com/articles/shinyapps.html
+<<<<<<< HEAD
 rsconnect/
+=======
+rsconnect/
+>>>>>>> 3957aec8600a579bd8264fe6bf4bf7294463c6df
