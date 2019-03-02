@@ -1,0 +1,386 @@
+---
+title: "Estimation of Direct and Indirect Storage, Ramuschaka"
+author: "Edward Davis"
+date: "2/19/2019"
+output: 
+  html_document:
+    theme: sandstone
+    css: styles.css
+    highlight: pygments
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.align = "center")
+```
+### Necessary libraries
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(readxl)
+library(skimr)
+library(lubridate)
+library(padr)
+library(broom)
+library(scales)
+```
+
+```{r graphing-stuff, include=FALSE}
+extrafont::loadfonts(quiet = TRUE)
+hydro_theme <- function() {
+  theme_bw(base_size = 12, base_family = "IBM Plex Sans") %+replace%
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(size = 15, face = "bold", hjust = 0, 
+                                vjust = 2)
+    )
+}
+theme_set(hydro_theme())
+
+cb_palette <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+                "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+### Data import and basic tidying
+```{r data-import}
+# Import data
+ramu_precip <- read_excel("data/upper-middle.xlsx", sheet = "precip", skip = 1)
+ramu_stage <- read_excel("data/upper-middle.xlsx", sheet = "stage", skip = 1)
+
+# Data tidying
+upper_middle <- ramu_precip %>%
+  right_join(ramu_stage, by = "Date Time, GMT-05:00") %>%
+  rename(date_time = `Date Time, GMT-05:00`,
+         air_temp = `Temp, Â°C (LGR S/N: 20381067, SEN S/N: 20381067, LBL: T)`,
+         water_level_m = `Water Level (m)`,
+         q_est = `Q est m3/s`,
+         precip_mm = `mm of rain`) %>%
+  select(date_time, air_temp, precip_mm, water_level_m, q_est)
+
+# Display first few rows of tidied data
+kable(head(upper_middle))
+```
+
+# Recession Analysis
+### Smoothing gage data
+Here, I resample the data for hourly values, and smooth the discharge using a 72-hour moving average:
+```{r prepare-data, message=FALSE, warning=FALSE}
+# Resample data set for daily values
+daily_upper_middle <- upper_middle %>%
+  thicken("day", colname = "date") %>%
+  group_by(date) %>%
+  summarise(mean_daily_prcp = mean(precip_mm, na.rm = TRUE),
+            mean_daily_q = mean(q_est, na.rm = TRUE))
+
+# Resample data set for hourly values
+library(tidyquant)
+hourly_upper_middle <- upper_middle %>%
+  thicken("hour", colname = "dt_hour") %>%
+  group_by(dt_hour) %>%
+  summarise(hourly_q = mean(q_est, na.rm = TRUE),
+            hourly_p = mean(precip_mm, na.rm = TRUE)) %>%
+  mutate(row_id = seq(1, 3322)) %>%
+  tq_mutate(select = hourly_q,   # This function populates a 72-hr moving avg
+            mutate_fun = rollapply,
+            width = 72,
+            align = "right",
+            FUN = mean,
+            na.rm = TRUE,
+            col_rename = "roll_mean")
+```
+
+```{r smoothed-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 9, fig.asp= 0.4}
+# Plot of smoothed data
+hourly_upper_middle %>%
+  ggplot(aes(x = dt_hour)) +
+  geom_line(aes(y = hourly_q), color = "gray60", alpha = 0.5) +
+  geom_line(aes(y = roll_mean), color = "darkred") +
+  labs(title = "Hourly Streamflow and 72-hour Moving Average",
+       subtitle = "2018 Oct - 2019 Feb",
+       y = bquote("Streamflow ("~m^3~s^-1~")"), 
+       x = NULL)
+```
+
+### Extracting recession limbs
+Loop to find recession limbs that fit the criteria:
+
+1. No significant (> 0.002 mm) rainfall in the past 24 hours
+2. A decreasing Q
+```{r extraction-loop}
+# Counter variable — starts after 72-hr moving average begins
+i <- 73
+
+# Dummy data frame to hold row ID
+df <- tibble(row_id = col_integer())
+
+# Begin looping over hourly Q and P data
+while(i < nrow(hourly_upper_middle) - 1){
+  # Select rows that have < 0.002 mm 24-hour antecedent rainfall and have decreasing Q
+  if(mean(hourly_upper_middle$hourly_p[c(i - 24, i)]) < 0.002 &
+     hourly_upper_middle$roll_mean[i] <
+     hourly_upper_middle$roll_mean[i - 1]) {
+    df <- add_row(df, 
+                  row_id = as.integer(i))
+    i <- i + 1
+  } else {
+    i <- i + 1
+  }
+  
+}
+```
+
+### Filtering recession data
+Here, I narrow the data down to rainless recessions with a duration of 24 hours or more.
+```{r data-filter, message=FALSE, warning=FALSE}
+recession_limbs <- hourly_upper_middle %>%
+  right_join(df %>% unnest(row_id))
+
+dates1 <- recession_limbs$dt_hour
+df1 <- data.frame(dates1, group = cumsum(c(TRUE, diff(dates1) != 1)))
+
+recession_limbs <- df1 %>%
+  mutate(dt_hour = as_datetime(dates1)) %>%
+  left_join(recession_limbs)
+
+consec_days <- recession_limbs %>%
+  group_by(group) %>%
+  tally() %>%
+  filter(n >= 24) %>%
+  pull(group)
+
+recession_limbs <- recession_limbs %>%
+  filter(group %in% consec_days) %>%
+  select(dt_hour, recession = roll_mean, group, row_id)
+```
+
+
+Narrowing the data resulted in the extraction of `r {length(consec_days)}` recession periods:
+
+```{r extracted-limbs-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 9, fig.asp= 0.4}
+recession_limbs %>%
+  right_join(hourly_upper_middle, by = "dt_hour") %>%
+  ggplot(aes(x = dt_hour)) +
+  scale_x_datetime() +
+  geom_line(aes(y = hourly_q), color = "gray60", alpha = 0.5) +
+  geom_line(aes(y = roll_mean), color = "darkred") +
+  geom_point(aes(y = recession), color = "#0072B2", shape = 1, alpha = 0.3) +
+  labs(title = "Extracted Recession Limbs",
+       subtitle = "Duration > 24 hours",
+       y = bquote("Streamflow ("~m^3~s^-1~")"), 
+       x = NULL)
+```
+
+### Variable timestep, after Palmroth, et al. (2010)
+Application of variable timestep, using a threshold of $0.001\overline{Q}$ where $\overline{Q}$ is the mean hourly discharge over the entire dataset:
+
+```{r variable-timestep}
+threshold <- mean(hourly_upper_middle$hourly_q) * 0.001
+
+# Timestep of 1 hour
+one_hour_groups <- recession_limbs %>%
+  group_by(group) %>%
+  mutate(q_diffs = lag(recession, 1) - recession) %>%
+  filter(q_diffs < threshold) %>%
+  tally(group) %>%
+  select(group) %>%
+  pull()
+
+one_hour_step <- recession_limbs %>%
+  filter(!(group %in% one_hour_groups)) %>%
+  mutate(dt = 1)
+
+reject_groups <- one_hour_groups
+# Timestep of 2 hours
+two_hour_groups <- recession_limbs %>%
+  group_by(group) %>%
+  filter(group %in% one_hour_groups,
+         row_number() %% 2 == 0) %>%
+  mutate(q_diffs = lag(recession, 1) - recession) %>%
+  filter(q_diffs < threshold) %>%
+  tally(group) %>%
+  select(group) %>%
+  pull()
+
+two_hour_step <- recession_limbs %>%
+  filter(!(group %in% two_hour_groups) & group %in% one_hour_groups,
+         row_number() %% 2 == 0) %>%
+  mutate(dt = 2)
+
+reject_groups <- c(reject_groups, two_hour_groups)
+
+# Timestep of 3 hours
+three_hour_groups <- recession_limbs %>%
+  group_by(group) %>%
+  filter(group %in% reject_groups,
+         row_number() %% 3 == 1) %>%
+  mutate(q_diffs = lag(recession, 1) - recession) %>%
+  filter(q_diffs < threshold) %>%
+  tally(group) %>%
+  select(group) %>%
+  pull()
+
+three_hour_step <- recession_limbs %>%
+  filter(!(group %in% three_hour_groups) & group %in% two_hour_groups,
+         row_number() %% 3 == 1) %>%
+  mutate(dt = 3)
+
+reject_groups <- c(reject_groups, three_hour_groups)
+
+# Timestep of 4 hours
+four_hour_groups <- recession_limbs %>%
+  group_by(group) %>%
+  filter(group %in% reject_groups,
+         row_number() %% 4 == 1) %>%
+  mutate(q_diffs = lag(recession, 1) - recession) %>%
+  filter(q_diffs < threshold) %>%
+  tally(group) %>%
+  select(group) %>%
+  pull()
+
+four_hour_step <- recession_limbs %>%
+  filter(!(group %in% four_hour_groups) & group %in% three_hour_groups,
+         row_number() %% 4 == 1) %>%
+  mutate(dt = 4)
+```
+
+### Numerical differentiation
+Estimating $\frac{dQ}{dt}$ and binning values for averaging:
+
+```{r numerical-derivatives, warning=FALSE}
+# Ready data for numerical derivatives
+timestepped_recessions <- one_hour_step %>%
+  bind_rows(two_hour_step, three_hour_step, four_hour_step) %>%
+  arrange(dt_hour)
+
+# Estimating dq_dt using central difference, after Palmroth, et al. (2010)
+dq_dt <- timestepped_recessions %>%
+  group_by(group) %>%
+  mutate(dq = (lead(recession, 1) - lag(recession, 1)) / (2 * dt),
+         q = lead(recession, 1) + lag(recession, 1) / 2,
+         log_dq = log(abs(dq)),
+         log_q = log(q)) %>%
+  ungroup() %>%
+  filter(!(is.na(dq))) %>%
+  arrange(desc(q)) %>%
+  select(dq, q, log_dq, log_q)
+
+
+# Kirchner (2009) style binning - "Irregular Binning Method"
+log_q_range <- dq_dt %>%
+  summarise(log_q_range = 0.01 * (min(log_q) - max(log_q))) %>%
+  pull()
+
+bins <- c(1)
+
+for(r in seq(1, nrow(dq_dt) - 1)) {
+  
+  loud = FALSE
+  min_per_bin = 35 # Chosen to improve fit of linear regression
+  
+  # Testing to make sure values are in set range
+  if(dq_dt$log_q[r + 1] - dq_dt$log_q[r] < log_q_range){
+    if(loud){print("Bin too small")}
+    next
+  } 
+  # Testing to make sure bins are larger than min_per_bin value
+  if(abs(r - bins[length(bins)]) < min_per_bin){
+    if(loud){print("Not enough data points")}
+    next
+  }
+  # Testing for bin heterogeneity
+  curr = dq_dt$dq[c((bins[length(bins)]), (r + 1))]
+  
+  if(sd(-1 * curr) / sqrt(abs(r - bins[length(bins)])) > mean(-1 * curr)/2){
+    if(loud){print("Bin too heterogenous")}
+    next
+  }
+  bins <- c(bins, r)
+}
+
+# Binning data based on output from above loop
+binned <- dq_dt %>%
+  arrange(desc(log_q)) %>%
+  mutate(id = row_number(),
+         category = cut(id, breaks= bins, right = FALSE,
+                      labels=seq(1, (length(bins)-1)))) %>%
+  group_by(category) %>%
+  mutate(mean_dq = mean(abs(dq)),
+         se = sqrt(var(log_dq)/length(log_dq)),
+         weights = 1 / sqrt(se)) %>%
+  summarise(mean_dq = mean(-1 * dq),
+            mean_q = mean(q),
+            log_q = mean(log_q),
+            log_dq = mean(log_dq),
+            weights = max(weights),
+            se = max(se))
+```
+
+### Weighted linear regression
+I fit a quadratic curve to the binned data using a weighted linear regression, where the weights were equal to $\frac{1}{\sqrt{std. error}}$ for each binned $\log(-dQ/dt)$.
+
+```{r wlr}
+# Weighted linear regression
+model <- lm(binned$log_dq ~ poly(binned$log_q, 2), 
+            weights = binned$weights)
+
+# Capture parameters and R squared from model
+p0 <- number(model$coefficients[[1]], accuracy = 0.0001)
+p1 <- number(model$coefficients[[2]], accuracy = 0.0001)
+p2 <- number(model$coefficients[[3]], accuracy = 0.0001)
+r_sq <- number(summary(model)$r.squared, accuracy = 0.001)
+
+summary(model)
+```
+
+```{r gq-function-plot, echo=FALSE}
+binned %>%
+  ggplot(aes(x = log_q, y = log_dq)) +
+  geom_point(data = dq_dt, aes(x = log_q, y = log_dq), 
+             color = "gray60", alpha = 0.3) +
+  geom_smooth(aes(x = log_q, y = log_dq, weight = weights),
+            method = MASS::rlm, 
+            formula = y ~ poly(x, 2), 
+            se = FALSE,
+            color = "darkred",
+            size = 1) +
+  geom_errorbar(aes(ymin = log_dq - se, ymax = log_dq + se), 
+                color = "#0072B2", alpha = 0.5) +
+  geom_point(color = "#0072B2") +
+  scale_y_continuous() +
+  scale_x_continuous() +
+  labs(title = "Weighted Linear Regression of log(-dQ/dt)",
+       subtitle = bquote(~.(p0)+.(p1)~"log(Q)"~+.(p2)~"log"(Q)^2~"\n"~R^2==.(r_sq)),
+       y = bquote("log"~(-dQ/dt)),
+       x = bquote("log"~(Q)))
+```
+
+### Sensitivity function
+The general sensitivity function $g(Q)$ follows the form:
+$$g(Q) = \log\bigg(\frac{dQ/dt}{Q}\bigg) = p_0+(p_1 - 1) \log(Q) +p_2\log(Q)^2$$
+
+The sensitivity function for the Upper Middle Ramuschaka is:
+$$g(Q) = -9.9531+0.2943\log(Q)+0.2272\log(Q)^2$$
+
+# Estimating Evapotranspiration
+
+I compute $E_p$ using the Hargreaves equation after Allen, Peirera, Raes and Smith (1998):
+
+$$E_p = 0.0023\times(T_{mean}+17.8)\times(T_{max}-T_{min})^{0.5}\times0.408\times R_{est}$$
+
+1. Select 15-20 storms in which there is a clear recession following the storm a period of at least one day without additional rain and a subsequent rise in water level. Longer periods are better, but the recession limb must be at least one day.
+Over these recessions, calculate the daily discharge mean, and determine a representative dQ/dt. You will have to be clever about accounting for the diurnal oscillations in order to capture the recession limbs after storms. 
+
+2. Plot: log(-dQ/dt) versus log(Q). Here, you are plotting the sensitivity of discharge, Q, to changes in discharge (-dQ/dt), which should be related to changes in direct storage. 
+
+3. Fit a quadratic curve to the relationship and determine parameter, p0, p1, and p2. 
+
+4. Calculate g(Q), the sensitivity function of discharge to changes in direct storage. 
+
+5. Calculate Ep, evaporative losses using equation 10 from Dralle and estimates of Rext from pages 8-9 of Allan [1998] on Google Drive. 
+
+6. Calculate the cumulative Sd(t) from October 1, 2018 through Feb 16, 2019.  
+Calculate Si(t) over the same period. 
+
+7. Reproduce Figure 6 from Dralle et al., [2019] showing cumulative P, cumulative Q, ST, Si, and Sd from October 1, 2019 through Feb 16, 2019. The x-axis (time) should be linear. The y axis (mm of storage) should be logarithmic.
+
+
