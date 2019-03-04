@@ -20,6 +20,7 @@ library(tidyverse)
 library(readxl)
 library(lubridate)
 library(padr)
+library(tidyquant)
 library(scales)
 library(sirad)
 library(pracma)
@@ -74,11 +75,10 @@ daily_upper_middle <- upper_middle %>%
             mean_daily_prcp = ifelse(is.na(mean_daily_prcp), 
                                      0, mean_daily_prcp),
             mean_daily_q = mean(q_est, na.rm = TRUE),
-            q_mm = mean_daily_q/ (7.7e05) * 1000 * 86400,
+            q_mm = mean_daily_q / (7.7e05) * 1000 * 86400,
             mean_daily_t = mean(air_temp, na.rm = TRUE))
 
 # Resample data set for hourly values
-library(tidyquant)
 hourly_upper_middle <- upper_middle %>%
   thicken("hour", colname = "dt_hour") %>%
   group_by(dt_hour) %>%
@@ -104,7 +104,7 @@ hourly_upper_middle %>%
   geom_line(aes(y = roll_mean), color = "darkred") +
   labs(title = "Hourly Streamflow and 72-hour Moving Average",
        subtitle = "2018 Oct - 2019 Feb",
-       y = bquote("Runoff ("~mm~hr^-1~")"), 
+       y = bquote("Runoff ("~mm ~hr^-1~")"), 
        x = NULL)
 ```
 
@@ -173,7 +173,7 @@ recession_limbs %>%
   geom_point(aes(y = recession), color = "#0072B2", shape = 1, alpha = 0.3) +
   labs(title = "Extracted Recession Limbs",
        subtitle = "Duration > 24 hours",
-       y = bquote("Streamflow ("~m^3~s^-1~")"), 
+       y = bquote("Streamflow ("~mm ~hr^-1~")"), 
        x = NULL)
 ```
 
@@ -406,7 +406,7 @@ kable(head(E_p))
 ### Numerical integration
 
 ```{r direct_storage}
-q <- daily_upper_middle$mean_daily_q
+q <- daily_upper_middle$q_mm
 
 direct_s <- function(q) {
   num <- lag(q, 1) - q
@@ -437,24 +437,39 @@ direct_indirect <- daily_upper_middle %>%
          cum_q = cumsum(q_mm) - q_mm[1],
          cum_p = cumsum(mean_daily_prcp),
          i_s = cum_p - cum_q - E_p - d_s,
+         # Make E_p = 0 if i_s is negative
+         E_p = ifelse(i_s <=0, 0, E_p),
+         i_s = cum_p - cum_q - E_p - d_s,
+         # Make negative i_s = zero
          i_s = ifelse(i_s < 0, 0, i_s),
          total = cum_p - cum_q - E_p,
-         total = ifelse(total < 0, 0 , total))
+         # Make negative total = zero
+         total = ifelse(total < 0, 0 , total)) %>%
+  select(date, q_mm, cum_p, cum_q, d_s, i_s, total, E_p)
 ```
 
-```{r cumulative-plot, message=F, warning=F}
+### Plot of final results
+
+```{r cumulative-plot, echo=F, message=F, warning=F}
 direct_indirect %>%
-  gather(category, measurement, mean_daily_prcp:total) %>%
-  filter(category %in% c("cum_p", "cum_q", 
-                         "d_s", "i_s", "total")) %>%
+  gather(category, measurement, cum_p:total) %>%
   ggplot(aes(x = date, y = measurement, 
              color = category, linetype = category)) +
   geom_line() +
   scale_y_log10("[mm]", 
-                limits = c(1e-04, 8e2),
+                limits = c(1e-03, 10e3),
                 breaks = trans_breaks("log10", function(x) 10^x),
                 labels = trans_format("log10", math_format(10^.x))) +
-  annotation_logticks(size = 0.5, alpha = 0.4)
+  annotation_logticks(size = 0.5, alpha = 0.4) +
+  xlab("") +
+  scale_colour_discrete(name="", 
+                        labels= c("\u03A3P", "\u03A3Q", 
+                                  bquote("S"[i]), bquote("S"[d]),
+                                  bquote("S"[T]))) +
+  scale_linetype_discrete(name="", 
+                        labels= c("\u03A3P", "\u03A3Q", 
+                                  bquote("S"[i]), bquote("S"[d]),
+                                  bquote("S"[T])))
 ```
 
 
