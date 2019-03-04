@@ -12,16 +12,17 @@ output:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE,
                       fig.align = "center")
+library(knitr)
 ```
-### Necessary libraries
+### Libraries used
 ```{r libraries, message=FALSE}
 library(tidyverse)
 library(readxl)
-library(skimr)
 library(lubridate)
 library(padr)
-library(broom)
 library(scales)
+library(sirad)
+library(pracma)
 ```
 
 ```{r graphing-stuff, include=FALSE}
@@ -69,16 +70,22 @@ Here, I resample the data for hourly values, and smooth the discharge using a 72
 daily_upper_middle <- upper_middle %>%
   thicken("day", colname = "date") %>%
   group_by(date) %>%
-  summarise(mean_daily_prcp = mean(precip_mm, na.rm = TRUE),
-            mean_daily_q = mean(q_est, na.rm = TRUE))
+  summarise(mean_daily_prcp = sum(precip_mm),
+            mean_daily_prcp = ifelse(is.na(mean_daily_prcp), 
+                                     0, mean_daily_prcp),
+            mean_daily_q = mean(q_est, na.rm = TRUE),
+            q_mm = mean_daily_q/ (7.7e05) * 1000 * 86400,
+            mean_daily_t = mean(air_temp, na.rm = TRUE))
 
 # Resample data set for hourly values
 library(tidyquant)
 hourly_upper_middle <- upper_middle %>%
   thicken("hour", colname = "dt_hour") %>%
   group_by(dt_hour) %>%
-  summarise(hourly_q = mean(q_est, na.rm = TRUE),
-            hourly_p = mean(precip_mm, na.rm = TRUE)) %>%
+  summarise(hourly_q = mean(q_est, 
+                            na.rm = TRUE) / (7.7e05) * 1000 * 3600,
+            hourly_p = sum(precip_mm, na.rm = TRUE),
+            hourly_t = mean(air_temp, na.rm = TRUE)) %>%
   mutate(row_id = seq(1, 3322)) %>%
   tq_mutate(select = hourly_q,   # This function populates a 72-hr moving avg
             mutate_fun = rollapply,
@@ -97,7 +104,7 @@ hourly_upper_middle %>%
   geom_line(aes(y = roll_mean), color = "darkred") +
   labs(title = "Hourly Streamflow and 72-hour Moving Average",
        subtitle = "2018 Oct - 2019 Feb",
-       y = bquote("Streamflow ("~m^3~s^-1~")"), 
+       y = bquote("Runoff ("~mm~hr^-1~")"), 
        x = NULL)
 ```
 
@@ -174,7 +181,7 @@ recession_limbs %>%
 Application of variable timestep, using a threshold of $0.001\overline{Q}$ where $\overline{Q}$ is the mean hourly discharge over the entire dataset:
 
 ```{r variable-timestep}
-threshold <- mean(hourly_upper_middle$hourly_q) * 0.001
+threshold <- mean(hourly_upper_middle$roll_mean, na.rm = TRUE) * 0.001
 
 # Timestep of 1 hour
 one_hour_groups <- recession_limbs %>%
@@ -274,7 +281,7 @@ bins <- c(1)
 
 for(r in seq(1, nrow(dq_dt) - 1)) {
   
-  loud = FALSE
+  loud = F
   min_per_bin = 35 # Chosen to improve fit of linear regression
   
   # Testing to make sure values are in set range
@@ -360,27 +367,94 @@ $$g(Q) = \log\bigg(\frac{dQ/dt}{Q}\bigg) = p_0+(p_1 - 1) \log(Q) +p_2\log(Q)^2$$
 
 The sensitivity function for the Upper Middle Ramuschaka is:
 $$g(Q) = -9.9531+0.2943\log(Q)+0.2272\log(Q)^2$$
+```{r define_sens_func}
+p0 <- model$coefficients[[1]]
+p1 <- model$coefficients[[2]]
+p2 <- model$coefficients[[3]]
+
+g <- function(q, p0, p1, p2){
+  g <- p0 + (p1 * log(q)) + (p2 * (log(q)^2))
+  return(g)
+}
+```
 
 # Estimating Evapotranspiration
 
-I compute $E_p$ using the Hargreaves equation after Allen, Peirera, Raes and Smith (1998):
+I compute $E_p$ using the Hargreaves equation after Dralle et al, (2017) and Allen, Peirera, Raes and Smith (1998):
 
 $$E_p = 0.0023\times(T_{mean}+17.8)\times(T_{max}-T_{min})^{0.5}\times0.408\times R_{est}$$
 
-1. Select 15-20 storms in which there is a clear recession following the storm a period of at least one day without additional rain and a subsequent rise in water level. Longer periods are better, but the recession limb must be at least one day.
-Over these recessions, calculate the daily discharge mean, and determine a representative dQ/dt. You will have to be clever about accounting for the diurnal oscillations in order to capture the recession limbs after storms. 
+Daily $R_{est}$ was calculated using the `extrat()` function in the `sirad` package by Jedrzej S. Bojanowski, which uses the same methods described in Allen, et al. (1998).
 
-2. Plot: log(-dQ/dt) versus log(Q). Here, you are plotting the sensitivity of discharge, Q, to changes in discharge (-dQ/dt), which should be related to changes in direct storage. 
+```{r e_p-estimates}
+zurite_lat <- -13.439
 
-3. Fit a quadratic curve to the relationship and determine parameter, p0, p1, and p2. 
+E_p <- hourly_upper_middle %>%
+  mutate(day = yday(dt_hour),
+         date = date(dt_hour)) %>%
+  group_by(day) %>%
+  mutate(r_est = extrat(day, zurite_lat)[[1]],
+         E_p = 0.0023 * (max(hourly_t) + 17.8) * ((max(hourly_t) - min(hourly_t)) ^ 0.5) * 0.408 * r_est) %>%
+  summarise(date = mean(date), r_est = mean(r_est), 
+            E_p = mean(E_p)) %>%
+  arrange(date)
 
-4. Calculate g(Q), the sensitivity function of discharge to changes in direct storage. 
+kable(head(E_p))
+```
 
-5. Calculate Ep, evaporative losses using equation 10 from Dralle and estimates of Rext from pages 8-9 of Allan [1998] on Google Drive. 
+# Determining $S_d$ and $S_i$
+### Numerical integration
 
-6. Calculate the cumulative Sd(t) from October 1, 2018 through Feb 16, 2019.  
-Calculate Si(t) over the same period. 
+```{r direct_storage}
+q <- daily_upper_middle$mean_daily_q
 
-7. Reproduce Figure 6 from Dralle et al., [2019] showing cumulative P, cumulative Q, ST, Si, and Sd from October 1, 2019 through Feb 16, 2019. The x-axis (time) should be linear. The y axis (mm of storage) should be logarithmic.
+direct_s <- function(q) {
+  num <- lag(q, 1) - q
+  num <- num[-1]
+  denom <- g(q, p0, p1, p2)
+  denom <- denom[-1]
+                 
+  x <- seq(1, length(num))
+  y <- num / denom
+  
+  s_d <- c(0)
+  int <- cumtrapz(x, y)
+  
+  s_d <- c(s_d, int)
+  return(s_d)
+}
+```
+
+
+### Cumulative values and calculation of $S_i$
+
+```{r indirect_storage}
+direct_indirect <- daily_upper_middle %>%
+  right_join(E_p, by = "date") %>%
+  add_column(d_s = direct_s(q)) %>%
+  # If d_s < 0, I assume that it is = 0
+  mutate(d_s = ifelse(d_s < 0, 0, d_s),
+         cum_q = cumsum(q_mm) - q_mm[1],
+         cum_p = cumsum(mean_daily_prcp),
+         i_s = cum_p - cum_q - E_p - d_s,
+         i_s = ifelse(i_s < 0, 0, i_s),
+         total = cum_p - cum_q - E_p,
+         total = ifelse(total < 0, 0 , total))
+```
+
+```{r cumulative-plot, message=F, warning=F}
+direct_indirect %>%
+  gather(category, measurement, mean_daily_prcp:total) %>%
+  filter(category %in% c("cum_p", "cum_q", 
+                         "d_s", "i_s", "total")) %>%
+  ggplot(aes(x = date, y = measurement, 
+             color = category, linetype = category)) +
+  geom_line() +
+  scale_y_log10("[mm]", 
+                limits = c(1e-04, 8e2),
+                breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  annotation_logticks(size = 0.5, alpha = 0.4)
+```
 
 
