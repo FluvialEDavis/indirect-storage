@@ -2,11 +2,12 @@
 title: "Estimation of Direct and Indirect Storage, Ramuschaka"
 author: "Edward Davis"
 date: "2/19/2019"
-output: 
+output:
   html_document:
-    theme: sandstone
     css: styles.css
     highlight: pygments
+    theme: sandstone
+  pdf_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -106,6 +107,8 @@ hourly_upper_middle %>%
        subtitle = "2018 Oct - 2019 Feb",
        y = bquote("Runoff ("~mm ~hr^-1~")"), 
        x = NULL)
+
+ggsave("figures/smoothed-q.png", width = 8.5, height = 5.5, unit = "in")
 ```
 
 ### Extracting recession limbs
@@ -175,6 +178,8 @@ recession_limbs %>%
        subtitle = "Duration > 24 hours",
        y = bquote("Streamflow ("~mm ~hr^-1~")"), 
        x = NULL)
+
+ggsave("figures/recession-plot.png", width = 8.5, height = 5.5, units = "in")
 ```
 
 ### Variable timestep, after Palmroth, et al. (2010)
@@ -359,6 +364,8 @@ binned %>%
        subtitle = bquote(~.(p0)+.(p1)~"log(Q)"~+.(p2)~"log"(Q)^2~"\n"~R^2==.(r_sq)),
        y = bquote("log"~(-dQ/dt)),
        x = bquote("log"~(Q)))
+
+ggsave("figures/wlr-plt.png", width = 8.5, height = 5.5, units = "in")
 ```
 
 ### Sensitivity function
@@ -470,6 +477,8 @@ direct_indirect %>%
                         labels= c("\u03A3P", "\u03A3Q", 
                                   bquote("S"[i]), bquote("S"[d]),
                                   bquote("S"[T])))
+
+ggsave("figures/storage-plot.png", width = 8.5, height = 5.5, units = "in")
 ```
 
 
