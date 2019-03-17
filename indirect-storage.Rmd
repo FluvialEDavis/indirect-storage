@@ -7,7 +7,6 @@ output:
     css: styles.css
     highlight: pygments
     theme: sandstone
-  pdf_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -27,7 +26,7 @@ library(sirad)
 library(pracma)
 ```
 
-```{r graphing-stuff, include=FALSE}
+```{r graphing-opts, include=FALSE}
 extrafont::loadfonts(quiet = TRUE)
 hydro_theme <- function() {
   theme_bw(base_size = 12, base_family = "IBM Plex Sans") %+replace%
@@ -76,33 +75,33 @@ daily_upper_middle <- upper_middle %>%
             mean_daily_prcp = ifelse(is.na(mean_daily_prcp), 
                                      0, mean_daily_prcp),
             mean_daily_q = mean(q_est, na.rm = TRUE),
-            q_mm = mean_daily_q / (7.7e05) * 1000 * 86400,
+            mean_daily_q_mm = mean_daily_q / (7.7e05) * 1000 * 86400,
             mean_daily_t = mean(air_temp, na.rm = TRUE))
 
 # Resample data set for hourly values
 hourly_upper_middle <- upper_middle %>%
   thicken("hour", colname = "dt_hour") %>%
   group_by(dt_hour) %>%
-  summarise(hourly_q = mean(q_est, 
+  summarise(hourly_q_mm = mean(q_est, 
                             na.rm = TRUE) / (7.7e05) * 1000 * 3600,
             hourly_p = sum(precip_mm, na.rm = TRUE),
             hourly_t = mean(air_temp, na.rm = TRUE)) %>%
   mutate(row_id = seq(1, 3322)) %>%
-  tq_mutate(select = hourly_q,   # This function populates a 72-hr moving avg
+  tq_mutate(select = hourly_q_mm,   # This function populates a 72-hr moving avg
             mutate_fun = rollapply,
             width = 72,
             align = "right",
             FUN = mean,
             na.rm = TRUE,
-            col_rename = "roll_mean")
+            col_rename = "roll_mean_q")
 ```
 
 ```{r smoothed-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 9, fig.asp= 0.4}
 # Plot of smoothed data
 hourly_upper_middle %>%
   ggplot(aes(x = dt_hour)) +
-  geom_line(aes(y = hourly_q), color = "gray60", alpha = 0.5) +
-  geom_line(aes(y = roll_mean), color = "darkred") +
+  geom_line(aes(y = hourly_q_mm), color = "gray60", alpha = 0.5) +
+  geom_line(aes(y = roll_mean_q), color = "darkred") +
   labs(title = "Hourly Streamflow and 72-hour Moving Average",
        subtitle = "2018 Oct - 2019 Feb",
        y = bquote("Runoff ("~mm ~hr^-1~")"), 
@@ -117,33 +116,38 @@ Loop to find recession limbs that fit the criteria:
 1. No significant (> 0.002 mm) rainfall in the past 24 hours
 2. A decreasing Q
 ```{r extraction-loop}
-# Counter variable — starts after 72-hr moving average begins
-i <- 73
-
-# Dummy data frame to hold row ID
-df <- tibble(row_id = col_integer())
-
-# Begin looping over hourly Q and P data
-while(i < nrow(hourly_upper_middle) - 1){
-  # Select rows that have < 0.002 mm 24-hour antecedent rainfall and have decreasing Q
-  if(mean(hourly_upper_middle$hourly_p[c(i - 24, i)]) < 0.002 &
-     hourly_upper_middle$roll_mean[i] <
-     hourly_upper_middle$roll_mean[i - 1]) {
-    df <- add_row(df, 
-                  row_id = as.integer(i))
-    i <- i + 1
-  } else {
-    i <- i + 1
-  }
+recess_extract <- function(q, p, start_row = 1) {
+  # Counter variable — starts after 72-hr moving average begins
+  i <- start_row
   
+  # Dummy data frame to hold row ID
+  row_id <- rep(NA, nrow(hourly_upper_middle))
+
+  # Begin looping over hourly Q and P data
+  while(i < nrow(hourly_upper_middle) - 1){
+    # Select rows that have < 0.002 mm 24-hour antecedent rainfall and have decreasing Q
+    if(mean(hourly_upper_middle$hourly_p[c(i - 24, i)]) < 0.002 &
+       hourly_upper_middle$roll_mean_q[i] <
+       hourly_upper_middle$roll_mean_q[i - 1]) {
+      
+      row_id[i] <- i
+      i <- i + 1
+    } else {
+      i <- i + 1
+    }
+    
+  }
+  row_id <<- data.frame(row_id = row_id[!is.na(row_id)])
 }
+
+recess_extract(hourly_upper_middle$hourly_q_mm, hourly_upper_middle$hourly_q_mm, start_row = 73)
 ```
 
 ### Filtering recession data
 Here, I narrow the data down to rainless recessions with a duration of 24 hours or more.
 ```{r data-filter, message=FALSE, warning=FALSE}
 recession_limbs <- hourly_upper_middle %>%
-  right_join(df %>% unnest(row_id))
+  right_join(row_id)
 
 dates1 <- recession_limbs$dt_hour
 df1 <- data.frame(dates1, group = cumsum(c(TRUE, diff(dates1) != 1)))
@@ -152,28 +156,28 @@ recession_limbs <- df1 %>%
   mutate(dt_hour = as_datetime(dates1)) %>%
   left_join(recession_limbs)
 
-consec_days <- recession_limbs %>%
+consec_events <- recession_limbs %>%
   group_by(group) %>%
   tally() %>%
   filter(n >= 24) %>%
   pull(group)
 
 recession_limbs <- recession_limbs %>%
-  filter(group %in% consec_days) %>%
-  select(dt_hour, recession = roll_mean, group, row_id)
+  filter(group %in% consec_events) %>%
+  select(dt_hour, q = roll_mean_q, group, row_id)
 ```
 
 
-Narrowing the data resulted in the extraction of `r {length(consec_days)}` recession periods:
+Narrowing the data resulted in the extraction of `r {length(consec_events)}` recession periods:
 
 ```{r extracted-limbs-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 9, fig.asp= 0.4}
 recession_limbs %>%
   right_join(hourly_upper_middle, by = "dt_hour") %>%
   ggplot(aes(x = dt_hour)) +
   scale_x_datetime() +
-  geom_line(aes(y = hourly_q), color = "gray60", alpha = 0.5) +
-  geom_line(aes(y = roll_mean), color = "darkred") +
-  geom_point(aes(y = recession), color = "#0072B2", shape = 1, alpha = 0.3) +
+  geom_line(aes(y = hourly_q_mm), color = "gray60", alpha = 0.5) +
+  geom_line(aes(y = roll_mean_q), color = "darkred") +
+  geom_point(aes(y = q), color = "#0072B2", shape = 1, alpha = 0.3) +
   labs(title = "Extracted Recession Limbs",
        subtitle = "Duration > 24 hours",
        y = bquote("Streamflow ("~mm ~hr^-1~")"), 
@@ -186,12 +190,12 @@ ggsave("figures/recession-plot.png", width = 8.5, height = 5.5, units = "in")
 Application of variable timestep, using a threshold of $0.001\overline{Q}$ where $\overline{Q}$ is the mean hourly discharge over the entire dataset:
 
 ```{r variable-timestep}
-threshold <- mean(hourly_upper_middle$roll_mean, na.rm = TRUE) * 0.001
+threshold <- mean(hourly_upper_middle$roll_mean_q, na.rm = TRUE) * 0.001
 
 # Timestep of 1 hour
 one_hour_groups <- recession_limbs %>%
   group_by(group) %>%
-  mutate(q_diffs = lag(recession, 1) - recession) %>%
+  mutate(q_diffs = lag(q, 1) - q) %>%
   filter(q_diffs < threshold) %>%
   tally(group) %>%
   select(group) %>%
@@ -207,7 +211,7 @@ two_hour_groups <- recession_limbs %>%
   group_by(group) %>%
   filter(group %in% one_hour_groups,
          row_number() %% 2 == 0) %>%
-  mutate(q_diffs = lag(recession, 1) - recession) %>%
+  mutate(q_diffs = lag(q, 1) - q) %>%
   filter(q_diffs < threshold) %>%
   tally(group) %>%
   select(group) %>%
@@ -225,7 +229,7 @@ three_hour_groups <- recession_limbs %>%
   group_by(group) %>%
   filter(group %in% reject_groups,
          row_number() %% 3 == 1) %>%
-  mutate(q_diffs = lag(recession, 1) - recession) %>%
+  mutate(q_diffs = lag(q, 1) - q) %>%
   filter(q_diffs < threshold) %>%
   tally(group) %>%
   select(group) %>%
@@ -243,7 +247,7 @@ four_hour_groups <- recession_limbs %>%
   group_by(group) %>%
   filter(group %in% reject_groups,
          row_number() %% 4 == 1) %>%
-  mutate(q_diffs = lag(recession, 1) - recession) %>%
+  mutate(q_diffs = lag(q, 1) - q) %>%
   filter(q_diffs < threshold) %>%
   tally(group) %>%
   select(group) %>%
@@ -267,8 +271,8 @@ timestepped_recessions <- one_hour_step %>%
 # Estimating dq_dt using central difference, after Palmroth, et al. (2010)
 dq_dt <- timestepped_recessions %>%
   group_by(group) %>%
-  mutate(dq = (lead(recession, 1) - lag(recession, 1)) / (2 * dt),
-         q = lead(recession, 1) + lag(recession, 1) / 2,
+  mutate(dq = (lead(q, 1) - lag(q, 1)) / (2 * dt),
+         q = lead(q, 1) + lag(q, 1) / 2,
          log_dq = log(abs(dq)),
          log_q = log(q)) %>%
   ungroup() %>%
@@ -376,11 +380,11 @@ The sensitivity function for the Upper Middle Ramuschaka is:
 $$g(Q) = -8.4108+0.2943\log(Q)+0.2272\log(Q)^2$$
 ```{r define_sens_func}
 p0 <- model$coefficients[[1]]
-p1 <- model$coefficients[[2]] - 1
+p1 <- model$coefficients[[2]]
 p2 <- model$coefficients[[3]]
 
 g <- function(q, p0, p1, p2){
-  g <- p0 + (p1 * log(q)) + (p2 * (log(q)^2))
+  g <- p0 + ((p1 - 1) * log(q)) + (p2 * (log(q)^2))
   return(g)
 }
 ```
@@ -413,7 +417,7 @@ kable(head(E_p))
 ### Numerical integration
 
 ```{r direct_storage}
-q <- daily_upper_middle$q_mm
+q <- daily_upper_middle$mean_daily_q_mm
 
 direct_s <- function(q) {
   num <- lag(q, 1) - q
@@ -441,7 +445,7 @@ direct_indirect <- daily_upper_middle %>%
   add_column(d_s = direct_s(q)) %>%
   # If d_s < 0, I assume that it is = 0
   mutate(d_s = ifelse(d_s < 0, 0, d_s),
-         cum_q = cumsum(q_mm) - q_mm[1],
+         cum_q = cumsum(mean_daily_q_mm) - mean_daily_q_mm[1],
          cum_p = cumsum(mean_daily_prcp),
          i_s = cum_p - cum_q - E_p - d_s,
          # Make E_p = 0 if i_s is negative
@@ -452,7 +456,7 @@ direct_indirect <- daily_upper_middle %>%
          total = cum_p - cum_q - E_p,
          # Make negative total = zero
          total = ifelse(total < 0, 0 , total)) %>%
-  select(date, q_mm, cum_p, cum_q, d_s, i_s, total, E_p)
+  select(date, mean_daily_q_mm, cum_p, cum_q, d_s, i_s, total, E_p)
 ```
 
 ### Plot of final results
