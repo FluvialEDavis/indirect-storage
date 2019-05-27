@@ -20,10 +20,10 @@ library(tidyverse)
 library(readxl)
 library(lubridate)
 library(padr)
-library(tidyquant)
 library(scales)
 library(sirad)
 library(pracma)
+library(gt)
 ```
 
 ```{r graphing-opts, include=FALSE}
@@ -46,27 +46,37 @@ cb_palette <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
 ### Data import and basic tidying
 ```{r data-import}
 # Import data
-ramu_precip <- read_excel("data/upper-middle.xlsx", sheet = "precip", skip = 1)
-ramu_stage <- read_excel("data/upper-middle.xlsx", sheet = "stage", skip = 1)
+ramu_precip <- read_excel("data/upper-middle.xlsx", sheet = "precip_update",
+                          skip = 1)
+ramu_stage <- read_excel("data/upper-middle.xlsx", sheet = "stage_update", 
+                         skip = 1)
 
 # Data tidying
 upper_middle <- ramu_precip %>%
   right_join(ramu_stage, by = "Date Time, GMT-05:00") %>%
   rename(date_time = `Date Time, GMT-05:00`,
          air_temp = `Temp, Â°C (LGR S/N: 20381067, SEN S/N: 20381067, LBL: T)`,
-         water_level_m = `Water Level (m)`,
+         water_level_m = `Sensor Depth (m)`,
          q_est = `Q est m3/s`,
          precip_mm = `mm of rain`) %>%
-  select(date_time, air_temp, precip_mm, water_level_m, q_est)
+  select(date_time, air_temp, precip_mm, water_level_m, q_est) %>% 
+  filter(!is.na(water_level_m))
 
 # Display first few rows of tidied data
-kable(head(upper_middle))
+head(upper_middle) %>% gt()
 ```
 
 # Recession Analysis
 ### Smoothing gage data
 Here, I resample the data for hourly values, and smooth the discharge using a 72-hour moving average:
 ```{r prepare-data, message=FALSE, warning=FALSE}
+
+cms_to_mm <- function(x, wshd_area, duration){
+# wshd_area in km2
+# duration in sec
+  x * duration / (wshd_area * 1e6) * 1000
+}
+
 # Resample data set for daily values
 daily_upper_middle <- upper_middle %>%
   thicken("day", colname = "date") %>%
@@ -75,35 +85,30 @@ daily_upper_middle <- upper_middle %>%
             mean_daily_prcp = ifelse(is.na(mean_daily_prcp), 
                                      0, mean_daily_prcp),
             mean_daily_q = mean(q_est, na.rm = TRUE),
-            mean_daily_q_mm = mean_daily_q / (7.7e05) * 1000 * 86400,
+            mean_daily_q_mm = cms_to_mm(mean_daily_q, 0.77, 86400),
             mean_daily_t = mean(air_temp, na.rm = TRUE))
 
 # Resample data set for hourly values
 hourly_upper_middle <- upper_middle %>%
   thicken("hour", colname = "dt_hour") %>%
   group_by(dt_hour) %>%
-  summarise(hourly_q_mm = mean(q_est, 
-                            na.rm = TRUE) / (7.7e05) * 1000 * 3600,
+  summarise(hourly_q = mean(q_est, na.rm = TRUE),
+            hourly_q_mm = cms_to_mm(hourly_q, 0.77, 3600),
             hourly_p = sum(precip_mm, na.rm = TRUE),
             hourly_t = mean(air_temp, na.rm = TRUE)) %>%
-  mutate(row_id = seq(1, 3322)) %>%
-  tq_mutate(select = hourly_q_mm,   # This function populates a 72-hr moving avg
-            mutate_fun = rollapply,
-            width = 72,
-            align = "right",
-            FUN = mean,
-            na.rm = TRUE,
-            col_rename = "roll_mean_q")
+  mutate(row_id = seq(1, length(hourly_q_mm)),
+         movavg_q = movavg(hourly_q_mm, 72, type = "s"))
+
 ```
 
-```{r smoothed-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 9, fig.asp= 0.4}
+```{r smoothed-plot, echo=FALSE, fig.asp=0.3, fig.width=9, message=FALSE, warning=FALSE}
 # Plot of smoothed data
 hourly_upper_middle %>%
   ggplot(aes(x = dt_hour)) +
   geom_line(aes(y = hourly_q_mm), color = "gray60", alpha = 0.5) +
-  geom_line(aes(y = roll_mean_q), color = "darkred") +
+  geom_line(aes(y = movavg_q), color = "darkred") +
   labs(title = "Hourly Streamflow and 72-hour Moving Average",
-       subtitle = "2018 Oct - 2019 Feb",
+       subtitle = "2018 Oct - 2019 Apr",
        y = bquote("Runoff ("~mm ~hr^-1~")"), 
        x = NULL)
 
@@ -126,9 +131,7 @@ recess_extract <- function(q, p, start_row = 1) {
   # Begin looping over hourly Q and P data
   while(i < nrow(hourly_upper_middle) - 1){
     # Select rows that have < 0.002 mm 24-hour antecedent rainfall and have decreasing Q
-    if(mean(hourly_upper_middle$hourly_p[c(i - 24, i)]) < 0.002 &
-       hourly_upper_middle$roll_mean_q[i] <
-       hourly_upper_middle$roll_mean_q[i - 1]) {
+    if(mean(p[c(i - 24, i)]) < 0.002 & q[i] < q[i - 1]) {
       
       row_id[i] <- i
       i <- i + 1
@@ -140,7 +143,7 @@ recess_extract <- function(q, p, start_row = 1) {
   row_id <<- data.frame(row_id = row_id[!is.na(row_id)])
 }
 
-recess_extract(hourly_upper_middle$hourly_q_mm, hourly_upper_middle$hourly_q_mm, start_row = 73)
+recess_extract(hourly_upper_middle$movavg_q, hourly_upper_middle$hourly_p, start_row = 25)
 ```
 
 ### Filtering recession data
@@ -164,33 +167,36 @@ consec_events <- recession_limbs %>%
 
 recession_limbs <- recession_limbs %>%
   filter(group %in% consec_events) %>%
-  select(dt_hour, q = roll_mean_q, group, row_id)
+  select(dt_hour, q = movavg_q, group, row_id)
 ```
 
 
 Narrowing the data resulted in the extraction of `r {length(consec_events)}` recession periods:
 
-```{r extracted-limbs-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 9, fig.asp= 0.4}
+```{r extracted-limbs-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 9, fig.asp= 0.3}
 recession_limbs %>%
   right_join(hourly_upper_middle, by = "dt_hour") %>%
   ggplot(aes(x = dt_hour)) +
-  scale_x_datetime() +
+  scale_x_datetime(breaks = date_breaks("1 month"),
+                   labels = date_format("%b %y")) +
   geom_line(aes(y = hourly_q_mm), color = "gray60", alpha = 0.5) +
-  geom_line(aes(y = roll_mean_q), color = "darkred") +
+  geom_line(aes(y = movavg_q), color = "darkred") +
   geom_point(aes(y = q), color = "#0072B2", shape = 1, alpha = 0.3) +
-  labs(title = "Extracted Recession Limbs",
-       subtitle = "Duration > 24 hours",
-       y = bquote("Streamflow ("~mm ~hr^-1~")"), 
+  # labs(title = "Extracted Recession Limbs",
+  #      subtitle = "Duration > 24 hours",
+  #      y = bquote("Streamflow ("~mm ~hr^-1~")"), 
+  #      x = NULL) +
+  labs(y = bquote("Streamflow ("~mm ~hr^-1~")"), 
        x = NULL)
 
-ggsave("figures/recession-plot.png", width = 8.5, height = 5.5, units = "in")
+ggsave("figures/recession-plot.png", width = 6.5, height = 3, units = "in")
 ```
 
 ### Variable timestep, after Palmroth, et al. (2010)
 Application of variable timestep, using a threshold of $0.001\overline{Q}$ where $\overline{Q}$ is the mean hourly discharge over the entire dataset:
 
 ```{r variable-timestep}
-threshold <- mean(hourly_upper_middle$roll_mean_q, na.rm = TRUE) * 0.001
+threshold <- mean(hourly_upper_middle$movavg_q, na.rm = TRUE) * 0.001
 
 # Timestep of 1 hour
 one_hour_groups <- recession_limbs %>%
@@ -291,7 +297,7 @@ bins <- c(1)
 for(r in seq(1, nrow(dq_dt) - 1)) {
   
   loud = F
-  min_per_bin = 35 # Chosen to improve fit of linear regression
+  min_per_bin = 45 # Chosen to improve fit of linear regression
   
   # Testing to make sure values are in set range
   if(dq_dt$log_q[r + 1] - dq_dt$log_q[r] < log_q_range){
@@ -364,12 +370,12 @@ binned %>%
   geom_point(color = "#0072B2") +
   scale_y_continuous() +
   scale_x_continuous() +
-  labs(title = "Weighted Linear Regression of log(-dQ/dt)",
+  labs(#title = "Weighted Linear Regression of log(-dQ/dt)",
        subtitle = bquote(~.(p0)+.(p1)~"log(Q)"~+.(p2)~"log"(Q)^2~"\n"~R^2==.(r_sq)),
        y = bquote("log"~(-dQ/dt)),
        x = bquote("log"~(Q)))
 
-ggsave("figures/wlr-plt.png", width = 8.5, height = 5.5, units = "in")
+ggsave("figures/wlr-plt.png", width = 5.5, height = 3, units = "in")
 ```
 
 ### Sensitivity function
@@ -401,16 +407,16 @@ Daily $R_{est}$ was calculated using the `extrat()` function in the `sirad` pack
 zurite_lat <- -13.439
 
 E_p <- hourly_upper_middle %>%
-  mutate(day = yday(dt_hour),
+  mutate(julian = yday(dt_hour),
          date = date(dt_hour)) %>%
-  group_by(day) %>%
-  mutate(r_est = extrat(day, zurite_lat)[[1]],
+  group_by(julian) %>%
+  mutate(r_est = extrat(julian, zurite_lat)[[1]],
          E_p = 0.0023 * (max(hourly_t) + 17.8) * ((max(hourly_t) - min(hourly_t)) ^ 0.5) * 0.408 * r_est) %>%
   summarise(date = mean(date), r_est = mean(r_est), 
             E_p = mean(E_p)) %>%
   arrange(date)
 
-kable(head(E_p))
+head(E_p) %>% gt()
 ```
 
 # Determining $S_d$ and $S_i$
@@ -462,15 +468,19 @@ direct_indirect <- daily_upper_middle %>%
 ### Plot of final results
 
 ```{r cumulative-plot, echo=F, message=F, warning=F}
+log_labs = c(0.001, 0.01, 0.1, 1, 10, 100, 1000)
 direct_indirect %>%
   gather(category, measurement, cum_p:total) %>%
   ggplot(aes(x = date, y = measurement, 
              color = category, linetype = category)) +
   geom_line() +
+  scale_x_date(breaks = date_breaks("1 month"),
+               labels = date_format("%b %y")) +
   scale_y_log10("[mm]", 
-                limits = c(1e-03, 10e3),
-                breaks = trans_breaks("log10", function(x) 10^x),
-                labels = trans_format("log10", math_format(10^.x))) +
+                limits = c(0.001, 1000),
+                breaks = log_labs,
+                labels = log_labs
+                ) +
   annotation_logticks(size = 0.5, alpha = 0.4) +
   xlab("") +
   scale_colour_discrete(name="", 
@@ -482,11 +492,11 @@ direct_indirect %>%
                                   bquote("S"[d]), bquote("S"[i]),
                                   bquote("S"[T])))
 
-ggsave("figures/storage-plot.png", width = 8.5, height = 5.5, units = "in")
+ggsave("figures/storage-plot-test-2.png", width = 5.5, height = 3, units = "in")
 ```
 
 ```{r}
-direct_indirect %>%
-  mutate(cum_et = cumsum(E_p))
+summary <- direct_indirect %>%
+  mutate(cum_et = cumsum(E_p)) %>% gt()
 ```
 
